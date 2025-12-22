@@ -1,10 +1,10 @@
 import { Injectable, signal, computed } from '@angular/core';
 
-export type ConnectionState = 
-  | 'disconnected' 
-  | 'connecting' 
-  | 'connected' 
-  | 'failed' 
+export type ConnectionState =
+  | 'disconnected'
+  | 'connecting'
+  | 'connected'
+  | 'failed'
   | 'closed';
 
 export interface ChunkHeader {
@@ -13,14 +13,26 @@ export interface ChunkHeader {
   TotalChunks: number;
 }
 
+export interface VideoChunkHeader {
+  Action: 'start' | 'data' | 'stop';
+  RecordingId: string;
+  CameraId: string;
+  MimeType: string;
+  ChunkIndex: number;    // Index within this video blob (0-based)
+  TotalChunks: number;   // Total chunks for this video blob
+  BlobIndex: number;     // Index of the MediaRecorder blob (increments each timeslice)
+}
+
 const CHUNK_SIZE = 16 * 1024; // 16KB chunks
-const HEADER_SIZE = 64; // Fixed header size in bytes
+const VIDEO_HEADER_SIZE = 256; // Larger header for video metadata (device IDs can be long)
+const IMAGE_HEADER_SIZE = 64; // Header size for images
 const SIGNALING_SERVER_URL = 'ws://localhost:5050/ws';
 
 @Injectable({ providedIn: 'root' })
 export class WebRtcService {
   private peerConnection: RTCPeerConnection | null = null;
-  private dataChannel: RTCDataChannel | null = null;
+  private imageDataChannel: RTCDataChannel | null = null;
+  private videoDataChannel: RTCDataChannel | null = null;
   private webSocket: WebSocket | null = null;
 
   // Signal-based reactive state
@@ -28,6 +40,9 @@ export class WebRtcService {
   readonly isConnected = computed(() => this.connectionState() === 'connected');
   readonly isSending = signal<boolean>(false);
   readonly sendProgress = signal<number>(0);
+  readonly isRecording = signal<boolean>(false);
+  readonly recordingCameraId = signal<string | null>(null);
+  readonly isVideoChannelOpen = signal<boolean>(false);
 
   /**
    * Establishes WebRTC connection to the .NET backend
@@ -46,12 +61,18 @@ export class WebRtcService {
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
       });
 
-      // Create the data channel BEFORE creating the offer
-      this.dataChannel = this.peerConnection.createDataChannel('image-transfer', {
+      // Create the image data channel
+      this.imageDataChannel = this.peerConnection.createDataChannel('image-transfer', {
         ordered: true
       });
 
-      this.setupDataChannelHandlers();
+      // Create the video data channel
+      this.videoDataChannel = this.peerConnection.createDataChannel('video-transfer', {
+        ordered: true
+      });
+
+      this.setupDataChannelHandlers(this.imageDataChannel, 'image');
+      this.setupDataChannelHandlers(this.videoDataChannel, 'video');
       this.setupPeerConnectionHandlers();
 
       // Connect to signaling server
@@ -77,15 +98,20 @@ export class WebRtcService {
    * Disconnects and cleans up resources
    */
   disconnect(): void {
-    this.dataChannel?.close();
+    this.imageDataChannel?.close();
+    this.videoDataChannel?.close();
     this.peerConnection?.close();
     this.webSocket?.close();
 
-    this.dataChannel = null;
+    this.imageDataChannel = null;
+    this.videoDataChannel = null;
     this.peerConnection = null;
     this.webSocket = null;
 
     this.connectionState.set('disconnected');
+    this.isRecording.set(false);
+    this.recordingCameraId.set(null);
+    this.isVideoChannelOpen.set(false);
     console.log('🔌 Disconnected');
   }
 
@@ -94,8 +120,8 @@ export class WebRtcService {
    * @param images Array of camera ID and image data pairs
    */
   async sendImages(images: { cameraId: string; imageData: ArrayBuffer }[]): Promise<void> {
-    if (!this.dataChannel || this.dataChannel.readyState !== 'open') {
-      throw new Error('Data channel is not open');
+    if (!this.imageDataChannel || this.imageDataChannel.readyState !== 'open') {
+      throw new Error('Image data channel is not open');
     }
 
     this.isSending.set(true);
@@ -116,6 +142,198 @@ export class WebRtcService {
     }
   }
 
+  // Blob counter for video recording
+  private currentBlobIndex = 0;
+
+  /**
+   * Starts video recording from the specified camera
+   */
+  startRecording(cameraId: string, stream: MediaStream, mimeType: string): MediaRecorder | null {
+    console.log(`🎬 startRecording called, channel state: ${this.videoDataChannel?.readyState}, isOpen signal: ${this.isVideoChannelOpen()}`);
+
+    if (!this.videoDataChannel || this.videoDataChannel.readyState !== 'open') {
+      console.error(`❌ Video data channel is not open (state: ${this.videoDataChannel?.readyState})`);
+      return null;
+    }
+
+    if (this.isRecording()) {
+      console.warn('Already recording');
+      return null;
+    }
+
+    const recordingId = `rec_${Date.now()}`;
+    this.currentBlobIndex = 0; // Reset blob counter for new recording
+
+    // Send start signal
+    this.sendVideoSignal('start', recordingId, cameraId, mimeType);
+
+    // Create MediaRecorder
+    console.log(`📹 Creating MediaRecorder with mimeType: ${mimeType}`);
+    const mediaRecorder = new MediaRecorder(stream, {
+      mimeType: mimeType,
+      videoBitsPerSecond: 5000000 // 5 Mbps for high quality
+    });
+
+    mediaRecorder.ondataavailable = async (event) => {
+      console.log(`📹 ondataavailable: ${event.data.size} bytes (blob #${this.currentBlobIndex})`);
+      if (event.data.size > 0) {
+        try {
+          const arrayBuffer = await event.data.arrayBuffer();
+          await this.sendVideoChunked(recordingId, cameraId, mimeType, arrayBuffer, this.currentBlobIndex);
+          this.currentBlobIndex++;
+        } catch (err) {
+          console.error('❌ Error sending video chunk:', err);
+        }
+      }
+    };
+
+    mediaRecorder.onstart = () => {
+      console.log('📹 MediaRecorder started!');
+    };
+
+    mediaRecorder.onstop = () => {
+      // Send stop signal
+      console.log('📹 MediaRecorder onstop event');
+      this.sendVideoSignal('stop', recordingId, cameraId, mimeType);
+      this.isRecording.set(false);
+      this.recordingCameraId.set(null);
+      console.log('🛑 Recording stopped');
+    };
+
+    mediaRecorder.onerror = (event) => {
+      console.error('❌ MediaRecorder error:', event);
+      this.isRecording.set(false);
+      this.recordingCameraId.set(null);
+    };
+
+    // Start recording with timeslice (send data every 1 second)
+    console.log('📹 Calling mediaRecorder.start(1000)...');
+    mediaRecorder.start(1000);
+
+    this.isRecording.set(true);
+    this.recordingCameraId.set(cameraId);
+    console.log(`🎬 Started recording from ${cameraId}, state: ${mediaRecorder.state}`);
+
+    return mediaRecorder;
+  }
+
+  private sendVideoSignal(action: 'start' | 'stop', recordingId: string, cameraId: string, mimeType: string): void {
+    if (!this.videoDataChannel || this.videoDataChannel.readyState !== 'open') {
+      console.warn(`⚠️ Video channel not open for ${action} signal (state: ${this.videoDataChannel?.readyState})`);
+      return;
+    }
+
+    const header: VideoChunkHeader = {
+      Action: action,
+      RecordingId: recordingId,
+      CameraId: cameraId,
+      MimeType: mimeType,
+      ChunkIndex: 0,
+      TotalChunks: 1,
+      BlobIndex: 0
+    };
+
+    const headerJson = JSON.stringify(header);
+    const headerBytes = new TextEncoder().encode(headerJson);
+
+    console.log(`📹 Video signal: ${action}, header size: ${headerBytes.length}/${VIDEO_HEADER_SIZE} bytes`);
+
+    if (headerBytes.length > VIDEO_HEADER_SIZE) {
+      console.error(`❌ Video header too large: ${headerBytes.length} > ${VIDEO_HEADER_SIZE}`);
+      return;
+    }
+
+    // Create padded header buffer
+    const packet = new Uint8Array(VIDEO_HEADER_SIZE);
+    packet.set(headerBytes);
+
+    try {
+      this.videoDataChannel.send(packet.buffer);
+      console.log(`✅ Video signal sent: ${action}`);
+    } catch (err) {
+      console.error(`❌ Failed to send video signal:`, err);
+    }
+  }
+
+  /**
+   * Sends video data in chunks, similar to how images are chunked
+   */
+  private async sendVideoChunked(
+    recordingId: string,
+    cameraId: string,
+    mimeType: string,
+    data: ArrayBuffer,
+    blobIndex: number
+  ): Promise<void> {
+    if (!this.videoDataChannel || this.videoDataChannel.readyState !== 'open') {
+      console.warn(`⚠️ Video channel not open (state: ${this.videoDataChannel?.readyState}), skipping blob`);
+      return;
+    }
+
+    const totalChunks = Math.ceil(data.byteLength / CHUNK_SIZE);
+    console.log(`📹 Chunking blob #${blobIndex}: ${data.byteLength} bytes into ${totalChunks} chunks`);
+
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, data.byteLength);
+      const chunkData = data.slice(start, end);
+
+      await this.sendSingleVideoPacket(recordingId, cameraId, mimeType, chunkData, i, totalChunks, blobIndex);
+    }
+
+    console.log(`✅ Sent all ${totalChunks} chunks for blob #${blobIndex}`);
+  }
+
+  /**
+   * Sends a single video data packet (one chunk of a blob)
+   */
+  private async sendSingleVideoPacket(
+    recordingId: string,
+    cameraId: string,
+    mimeType: string,
+    chunkData: ArrayBuffer,
+    chunkIndex: number,
+    totalChunks: number,
+    blobIndex: number
+  ): Promise<void> {
+    if (!this.videoDataChannel || this.videoDataChannel.readyState !== 'open') {
+      console.warn(`⚠️ Video channel not open, skipping chunk ${chunkIndex}/${totalChunks}`);
+      return;
+    }
+
+    const header: VideoChunkHeader = {
+      Action: 'data',
+      RecordingId: recordingId,
+      CameraId: cameraId,
+      MimeType: mimeType,
+      ChunkIndex: chunkIndex,
+      TotalChunks: totalChunks,
+      BlobIndex: blobIndex
+    };
+
+    const headerJson = JSON.stringify(header);
+    const headerBytes = new TextEncoder().encode(headerJson);
+
+    if (headerBytes.length > VIDEO_HEADER_SIZE) {
+      console.error(`❌ Video data header too large: ${headerBytes.length} > ${VIDEO_HEADER_SIZE}`);
+      return;
+    }
+
+    // Create padded header buffer + data
+    const packet = new Uint8Array(VIDEO_HEADER_SIZE + chunkData.byteLength);
+    packet.set(headerBytes);
+    packet.set(new Uint8Array(chunkData), VIDEO_HEADER_SIZE);
+
+    // Wait for buffer to clear if needed
+    await this.waitForVideoBufferDrain();
+
+    try {
+      this.videoDataChannel.send(packet.buffer);
+    } catch (err) {
+      console.error(`❌ Failed to send video chunk ${chunkIndex}/${totalChunks}:`, err);
+    }
+  }
+
   private async sendChunkedImage(cameraId: string, imageData: ArrayBuffer): Promise<void> {
     const totalChunks = Math.ceil(imageData.byteLength / CHUNK_SIZE);
     console.log(`📤 Sending ${cameraId}: ${imageData.byteLength} bytes in ${totalChunks} chunks`);
@@ -131,64 +349,83 @@ export class WebRtcService {
         TotalChunks: totalChunks
       };
 
-      const packet = this.createPacket(header, chunkData);
+      const packet = this.createImagePacket(header, chunkData);
 
       // Wait for buffer to clear if needed
-      await this.waitForBufferDrain();
+      await this.waitForImageBufferDrain();
 
-      this.dataChannel!.send(packet);
+      this.imageDataChannel!.send(packet);
     }
   }
 
-  private createPacket(header: ChunkHeader, chunkData: ArrayBuffer): ArrayBuffer {
+  private createImagePacket(header: ChunkHeader, chunkData: ArrayBuffer): ArrayBuffer {
     const headerJson = JSON.stringify(header);
     const headerBytes = new TextEncoder().encode(headerJson);
 
     // Create padded header buffer (64 bytes)
-    const headerBuffer = new Uint8Array(HEADER_SIZE);
+    const headerBuffer = new Uint8Array(IMAGE_HEADER_SIZE);
     headerBuffer.set(headerBytes);
 
     // Combine header + chunk data
-    const packet = new Uint8Array(HEADER_SIZE + chunkData.byteLength);
+    const packet = new Uint8Array(IMAGE_HEADER_SIZE + chunkData.byteLength);
     packet.set(headerBuffer);
-    packet.set(new Uint8Array(chunkData), HEADER_SIZE);
+    packet.set(new Uint8Array(chunkData), IMAGE_HEADER_SIZE);
 
     return packet.buffer;
   }
 
-  private async waitForBufferDrain(): Promise<void> {
-    const channel = this.dataChannel;
+  private async waitForImageBufferDrain(): Promise<void> {
+    const channel = this.imageDataChannel;
     if (!channel) return;
 
-    // Wait if buffer is getting full (backpressure)
     const MAX_BUFFERED = 256 * 1024; // 256KB
     while (channel.bufferedAmount > MAX_BUFFERED) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
   }
 
-  private setupDataChannelHandlers(): void {
-    if (!this.dataChannel) return;
+  private async waitForVideoBufferDrain(): Promise<void> {
+    const channel = this.videoDataChannel;
+    if (!channel) return;
 
-    this.dataChannel.onopen = () => {
-      console.log('📡 Data channel opened');
-      this.connectionState.set('connected');
+    const MAX_BUFFERED = 1024 * 1024; // 1MB for video
+    while (channel.bufferedAmount > MAX_BUFFERED) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+
+  private setupDataChannelHandlers(channel: RTCDataChannel, type: string): void {
+    channel.onopen = () => {
+      console.log(`📡 ${type} data channel opened, readyState: ${channel.readyState}`);
+      if (type === 'image') {
+        this.connectionState.set('connected');
+      }
+      if (type === 'video') {
+        this.isVideoChannelOpen.set(true);
+      }
+      // Log both channel states
+      console.log(`📡 Channel states - image: ${this.imageDataChannel?.readyState}, video: ${this.videoDataChannel?.readyState}`);
     };
 
-    this.dataChannel.onclose = () => {
-      console.log('📡 Data channel closed');
-      if (this.connectionState() === 'connected') {
+    channel.onclose = () => {
+      console.log(`📡 ${type} data channel closed`);
+      if (type === 'image' && this.connectionState() === 'connected') {
         this.connectionState.set('closed');
+      }
+      if (type === 'video') {
+        this.isVideoChannelOpen.set(false);
       }
     };
 
-    this.dataChannel.onerror = (error) => {
-      console.error('Data channel error:', error);
-      this.connectionState.set('failed');
+    channel.onerror = (error) => {
+      console.error(`${type} data channel error:`, error);
+      if (type === 'image') {
+        this.connectionState.set('failed');
+      }
     };
 
-    this.dataChannel.onmessage = (event) => {
-      console.log('Received message from server:', event.data);
+    channel.onmessage = (event) => {
+      console.log(`Received ${type} message from server:`, event.data);
     };
   }
 
@@ -214,7 +451,6 @@ export class WebRtcService {
 
       switch (state) {
         case 'connected':
-          // Connection state is set when data channel opens
           break;
         case 'disconnected':
         case 'closed':
