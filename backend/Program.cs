@@ -465,17 +465,71 @@ class VideoRecorder
         };
 
         var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-        var fileName = $"video_{_cameraId}_{timestamp}{extension}";
-        var filePath = Path.Combine(outputDirectory, fileName);
+        var baseFileName = $"video_{_cameraId[..8]}_{timestamp}"; // Use first 8 chars of camera ID
+        var rawFilePath = Path.Combine(outputDirectory, $"{baseFileName}{extension}");
 
         // Combine all blobs in order into final video file
-        using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write);
-        foreach (var kvp in _blobs)
+        using (var fileStream = new FileStream(rawFilePath, FileMode.Create, FileAccess.Write))
         {
-            fileStream.Write(kvp.Value, 0, kvp.Value.Length);
+            foreach (var kvp in _blobs)
+            {
+                fileStream.Write(kvp.Value, 0, kvp.Value.Length);
+            }
         }
 
-        Console.WriteLine($"✅ Saved video: {fileName} ({TotalBytes:N0} bytes, {_blobs.Count} blobs)");
+        Console.WriteLine($"💾 Saved raw video: {Path.GetFileName(rawFilePath)} ({TotalBytes:N0} bytes, {_blobs.Count} blobs)");
+
+        // Convert to MP4 if the source is WebM
+        if (extension == ".webm")
+        {
+            var mp4FilePath = Path.Combine(outputDirectory, $"{baseFileName}.mp4");
+            ConvertToMp4(rawFilePath, mp4FilePath);
+        }
+    }
+
+    private static void ConvertToMp4(string inputPath, string outputPath)
+    {
+        try
+        {
+            Console.WriteLine($"🔄 Converting to MP4...");
+            
+            var process = new System.Diagnostics.Process
+            {
+                StartInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "ffmpeg",
+                    Arguments = $"-i \"{inputPath}\" -c:v libx264 -preset fast -crf 22 -c:a aac -b:a 128k -y \"{outputPath}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            process.Start();
+            var stderr = process.StandardError.ReadToEnd(); // FFmpeg outputs to stderr
+            process.WaitForExit();
+
+            if (process.ExitCode == 0)
+            {
+                var mp4Size = new FileInfo(outputPath).Length;
+                Console.WriteLine($"✅ Converted to MP4: {Path.GetFileName(outputPath)} ({mp4Size:N0} bytes)");
+                
+                // Delete the original WebM file
+                File.Delete(inputPath);
+                Console.WriteLine($"🗑️ Deleted original WebM file");
+            }
+            else
+            {
+                Console.WriteLine($"❌ FFmpeg conversion failed (exit code {process.ExitCode})");
+                Console.WriteLine($"   Error: {stderr}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Error converting to MP4: {ex.Message}");
+            Console.WriteLine($"   Make sure FFmpeg is installed and in your PATH");
+        }
     }
 }
 
