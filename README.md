@@ -29,36 +29,81 @@ A cutting-edge Proof of Concept for capturing high-quality snapshots from multip
 ## 🚀 Getting Started
 
 ### Prerequisites
-- .NET 10 SDK
-- Node.js 18+ and npm
-- Multiple webcams (or use macOS Continuity Camera with iPhone)
 
-### Running the Application
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| .NET SDK | 10+ | [Download](https://dotnet.microsoft.com/download) |
+| Node.js | 18+ | [Download](https://nodejs.org/) |
+| npm | 9+ | Comes with Node.js |
+| FFmpeg | Any | Required for video recording MP4 conversion |
 
-1. **Start the Backend**:
+**Optional**: Multiple webcams or use macOS Continuity Camera with iPhone
+
+### Quick Start
+
+```bash
+# Terminal 1 - Backend
+cd backend
+dotnet run
+# → http://localhost:5050
+
+# Terminal 2 - Frontend
+cd frontend
+npm install
+npm start
+# → http://localhost:4200
+```
+
+### Step-by-Step Instructions
+
+1. **Clone and Install**:
+   ```bash
+   git clone <repo-url>
+   cd WebRTCDemo
+   
+   # Install frontend dependencies
+   cd frontend && npm install
+   ```
+
+2. **Start the Backend** (Terminal 1):
    ```bash
    cd backend
    dotnet run
    ```
-   Backend runs at: http://localhost:5050
+   You should see: `Now listening on: http://localhost:5050`
 
-2. **Start the Frontend**:
+3. **Start the Frontend** (Terminal 2):
    ```bash
    cd frontend
-   npm install
    npm start
    ```
-   Frontend runs at: http://localhost:4200
+   You should see: `Local: http://localhost:4200/`
 
-3. **Use the App**:
+4. **Open the App**:
+   - Navigate to http://localhost:4200 in your browser
+   - Allow camera permissions when prompted
+
+5. **Use the App**:
    - Click **"Refresh Cameras"** to detect webcams
    - Click **"Connect"** to establish WebRTC connection
-   - Click **"Capture & Send"** to snapshot all cameras and transfer
+   - Click **"Capture & Send"** to snapshot all cameras
+   - Click **"Start Recording"** to record video from all cameras
 
-4. **View Captured Images**:
+6. **View Captured Media**:
    ```bash
    ls backend/CapturedImages/
+   # Images: cam_01_20231223_120000.jpg
+   # Videos: rec_abc123_cam_01_20231223_120000.mp4
    ```
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Port 5050 in use | `lsof -ti:5050 \| xargs kill -9` |
+| Port 4200 in use | `lsof -ti:4200 \| xargs kill -9` |
+| No cameras detected | Check browser permissions, try refreshing |
+| Video not converting to MP4 | Install FFmpeg: `brew install ffmpeg` (macOS) |
 
 ## 📸 How It Works
 
